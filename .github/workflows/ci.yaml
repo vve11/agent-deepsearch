@@ -60,3 +60,32 @@ jobs:
 
       - name: 构建 Docker 镜像
         run: docker build --progress=plain -t agent-learning:ci .
+
+      - name: 启动容器
+        run: |
+          docker run -d \
+            --name research-ci \
+            -p 127.0.0.1:8001:8000 \
+            agent-learning:ci
+
+      - name: 等待服务并检查健康接口
+        run: |
+          for attempt in {1..30}; do
+            if curl --fail --silent --show-error --max-time 2 \
+              http://127.0.0.1:8001/api/health; then
+              echo
+              echo "健康检查通过"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "服务未能在等待时间内就绪"
+          exit 1
+
+      - name: 查看容器日志
+        if: always()
+        run: docker logs research-ci
+
+      - name: 清理容器
+        if: always()
+        run: docker rm -f research-ci
