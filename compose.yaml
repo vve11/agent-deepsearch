@@ -1,0 +1,15 @@
+services:
+  research:
+    build: .
+    image: agent-learning:v1
+
+    ports:
+      - "127.0.0.1:8001:8000"
+
+    env_file:
+      - .env
+
+    volumes:
+      - type: bind
+        source: ./data
+        target: /app/data
