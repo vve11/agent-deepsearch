@@ -6,6 +6,7 @@ from run import ResearchRun
 from dataclasses import asdict
 from checkpoint import AgentCheckpoint
 from plan import ResearchPlan, restore_plan, plan_context
+from task_execution import TaskExecution, validate_task_execution
 DB_PATH = Path(__file__).resolve().parent / "data" / "research.db"
 
 
@@ -84,6 +85,28 @@ def init_db() -> None:
                     run_id TEXT PRIMARY KEY NOT NULL REFERENCES runs(id),
                     phase TEXT NOT NULL CHECK (phase IN ('planning', 'planned', 'research'))
                 )"""
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS task_executions (
+                    run_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (status IN (
+                            'pending',
+                            'running',
+                            'completed',
+                            'failed'
+                        )),
+                    answer TEXT,
+                    evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+                    error TEXT,
+
+                    PRIMARY KEY (run_id, task_id),
+                    FOREIGN KEY (run_id)
+                        REFERENCES research_plans(run_id)
+                )
+                """
             )
 
 def _save_run(connection: sqlite3.Connection, run: ResearchRun) -> None:
@@ -411,3 +434,78 @@ def load_recent_events(run_id: str, limit: int = 100) -> list[dict]:
         ).fetchall()
     return [{**dict(row), "payload": json.loads(row["payload_json"])}
             for row in reversed(rows)]
+
+def initialize_task_executions(run_id: str) -> None:
+    """根据已保存的计划创建执行记录；已有记录保持不变。"""
+    plan = load_plan(run_id)
+
+    with closing(sqlite3.connect(DB_PATH)) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+
+        with connection:
+            for task in plan.tasks:
+                execution = TaskExecution(
+                    run_id=run_id,
+                    task_id=task.id,
+                )
+                validate_task_execution(execution)
+
+                connection.execute(
+                    """
+                    INSERT INTO task_executions (
+                        run_id,
+                        task_id,
+                        status,
+                        answer,
+                        evidence_ids_json,
+                        error
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(run_id, task_id) DO NOTHING
+                    """,
+                    (
+                        execution.run_id,
+                        execution.task_id,
+                        execution.status,
+                        execution.answer,
+                        json.dumps(
+                            execution.evidence_ids,
+                            ensure_ascii=False,
+                        ),
+                        execution.error,
+                    ),
+                )
+def load_task_execution(run_id: str, task_id: str) -> TaskExecution:
+    """读取一个子任务的执行记录，并校验数据。"""
+    plan = load_plan(run_id)
+
+    if not any(task.id == task_id for task in plan.tasks):
+        raise ValueError("这个子任务不属于当前研究计划")
+
+    with closing(sqlite3.connect(DB_PATH)) as connection:
+        connection.row_factory = sqlite3.Row
+
+        row = connection.execute(
+            """
+            SELECT run_id, task_id, status, answer,
+                   evidence_ids_json, error
+            FROM task_executions
+            WHERE run_id = ? AND task_id = ?
+            """,
+            (run_id, task_id),
+        ).fetchone()
+
+    if row is None:
+        raise LookupError("这个子任务尚未初始化执行记录")
+
+    execution = TaskExecution(
+        run_id=row["run_id"],
+        task_id=row["task_id"],
+        status=row["status"],
+        answer=row["answer"],
+        evidence_ids=json.loads(row["evidence_ids_json"]),
+        error=row["error"],
+    )
+
+    validate_task_execution(execution)
+    return execution
