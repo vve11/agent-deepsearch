@@ -7,6 +7,7 @@ from openai import AsyncOpenAI, APITimeoutError, APIConnectionError, APIStatusEr
 
 from database import load_run, load_events
 from runtime import execute_research, resume_research, get_resumable_runs
+from memory_commands import handle_memory_command
 
 
 def show_recovery_hint() -> None:
@@ -29,7 +30,8 @@ def choose_run() -> str | None:
     for index, run in enumerate(runs, start=1):
         title = " ".join(run["question"].split())[:100]
         status = "失败" if run["status"] == "failed" else "未完成"
-        phase = {"planning": "待生成计划", "planned": "计划已保存", "research": "研究中"}[run["phase"]]
+        phase = {"planning": "待生成计划", "planned": "计划已保存", "research": "研究中",
+                 "tasks": "子任务研究中", "synthesis": "待汇总"}.get(run["phase"], "研究中")
         print(f"{index}. {title} [{status}，{phase}，已保存 {run['evidence_count']} 条证据]")
     while True:
         selection = input("选择任务序号，回车或 0 取消：").strip()
@@ -49,6 +51,7 @@ async def run_cli(client: AsyncOpenAI) -> None:
     print("研究 Agent 已启动。")
     print("输入问题开始研究；/resume 选择任务；/continue 继续最近任务；/exit 退出。")
     print("也支持 /show 任务编号、/events 任务编号、/resume 任务编号。")
+    print("记忆命令：/memories、/memory 编号、/search-memory 关键词、/approve-memory 编号 理由、/archive-memory 编号、/retry-memory 研究编号。")
     show_recovery_hint()
 
     while True:
@@ -61,6 +64,8 @@ async def run_cli(client: AsyncOpenAI) -> None:
             print("问题不能为空。")
             continue
         command_parts = question.split(maxsplit=1)
+        if handle_memory_command(question):
+            continue
 
         if command_parts[0] in {"/show", "/events"}:
             command = command_parts[0]

@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 
 from openai import APIConnectionError, APIStatusError
+from budget import reserve, current_model
 
 logger = logging.getLogger(__name__)
 MAX_RETRIES = 2  # 首次请求之外最多再试两次
@@ -63,7 +64,10 @@ async def request_model(client, record_event, context: dict, **request):
     """仅重试未返回的非流式请求；最终仍抛出原异常。"""
     if request.get("stream"):
         raise ValueError("当前重试器只支持非流式模型请求")
+    request['model'] = current_model(request.get('model'))
     for attempt in range(MAX_RETRIES + 1):
+        # 每次实际尝试（包括重试）都先持久化扣减；崩溃不退还预算。
+        reserve('model')
         try:
             return await client.chat.completions.create(**request)
         except (APIConnectionError, APIStatusError) as error:

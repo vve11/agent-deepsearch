@@ -5,7 +5,7 @@ import remarkGfm from 'remark-gfm';
 import { request, sourceUrl } from './api';
 import './styles.css';
 
-const phaseLabels = { planning: '正在规划', planned: '准备研究', research: '正在研究' };
+const phaseLabels = { planning: '正在规划', planned: '准备研究', research: '正在研究', tasks: '正在执行子任务', synthesis: '正在汇总' };
 const eventLabels = {
   run_started: '创建研究任务', run_resumed: '继续研究', run_completed: '研究完成', run_failed: '研究中断',
   plan_started: '拆分研究问题', plan_generated: '生成研究计划', plan_saved: '计划已保存', plan_reused: '复用研究计划',
@@ -13,6 +13,9 @@ const eventLabels = {
   model_retrying: '等待重试', tool_started: '搜索资料', tool_completed: '搜索已返回', tool_failed: '搜索失败',
   tool_skipped: '工具预算已用尽', checkpoint_saved: '保存恢复点', citation_check_passed: '引用编号检查通过',
   citation_check_failed: '发现未知引用', repair_started: '修复引用', repair_completed: '引用修复完成', repair_failed: '引用修复失败',
+  tasks_initialized: '子任务已准备', task_started: '开始子任务', task_completed: '子任务已完成',
+  task_failed: '子任务中断', task_checkpoint_saved: '保存子任务恢复点',
+  budget_reserved: '记录调用预算', synthesis_started: '开始汇总报告', synthesis_saved: '报告已保存',
 };
 const examples = ['比较电动汽车电池回收的主要技术路线，附上来源。', '研究钠离子电池的应用场景与现阶段的局限。', '梳理光伏组件回收的主要方法和经济性。'];
 function statusLabel(run) {
@@ -146,6 +149,7 @@ function App() {
           {!detail.active && detail.status === 'running' && <div className="notice">当前没有后台任务在执行。研究可能因服务重启而中断；如恢复状态有效，可以点击“继续研究”。</div>}
           {detail.error && <div className="notice error"><strong>研究已中断</strong><p>{detail.error}</p>{detail.can_resume && <small>已保存的计划或检查点可用于继续。</small>}</div>}
           {detail.warning && <div className="notice">{detail.warning}</div>}
+          {detail.quality && <div className="plan-card"><div className="section-label">完成质量检查 <span>{({pending:'待检查',skipped:'未启用',checking:'正在检查',research:'补充研究',rewrite:'修复报告',passed:'已通过',exhausted:'未通过，已停止补救'})[detail.quality.phase]}</span></div><p>已使用 {detail.quality.used} / {detail.quality.limit} 轮补救。模型辅助检查不能替代独立事实核验。</p>{detail.quality.checks.map(check => <p key={check.name}>{check.passed ? '✓' : '✗'} {({minimum_evidence:'有效证据',citation_integrity:'正文引用',task_coverage:'任务覆盖',claim_support:'结论支持',report_consistency:'报告一致性'})[check.name]}：{check.reason}</p>)}{detail.quality.reason && <p>{detail.quality.reason}</p>}{!detail.answer && detail.quality.report && <details><summary>查看尚未通过质量验收的草稿</summary><pre style={{whiteSpace:'pre-wrap'}}>{detail.quality.report}</pre></details>}</div>}
           {detail.plan && <div className="plan-card"><div className="section-label">研究计划 <span>{detail.plan.tasks.length} 个调查方向</span></div>{detail.plan.tasks.map(task => <div className="plan-task" key={task.id}><span>{task.id}</span><p>{task.question}</p></div>)}</div>}
           <div className="tabs" role="tablist" aria-label="任务内容">{[['answer', '研究回答'], ['sources', `资料来源 ${detail.evidence.length}`], ['events', '执行过程']].map(([key, label]) => <button key={key} role="tab" aria-selected={tab === key} onClick={() => setTab(key)} className={tab === key ? 'active' : ''}>{label}</button>)}</div>
           <div role="tabpanel">

@@ -1,10 +1,12 @@
 import sqlite3
 import json
+import os
 from contextlib import closing
 from pathlib import Path
 from run import ResearchRun
-from dataclasses import asdict
-from checkpoint import AgentCheckpoint
+from dataclasses import asdict, replace
+from checkpoint import AgentCheckpoint, TaskCheckpoint
+from evidence import EvidenceStore
 from plan import ResearchPlan, restore_plan, plan_context
 from task_execution import TaskExecution, validate_task_execution
 DB_PATH = Path(__file__).resolve().parent / "data" / "research.db"
@@ -108,6 +110,30 @@ def init_db() -> None:
                 )
                 """
             )
+
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS task_checkpoints (
+                    run_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    state_json TEXT NOT NULL,
+                    PRIMARY KEY (run_id, task_id),
+                    FOREIGN KEY (run_id, task_id)
+                        REFERENCES task_executions(run_id, task_id)
+                )"""
+            )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS research_evidence (
+                    run_id TEXT PRIMARY KEY NOT NULL REFERENCES research_plans(run_id),
+                    evidence_json TEXT NOT NULL
+                )"""
+            )
+            from pipeline_storage import SCHEMA
+            connection.execute(SCHEMA)
+            from quality_storage import SCHEMA as QUALITY_SCHEMA
+            connection.execute(QUALITY_SCHEMA)
+            from memory_storage import init_memory_tables
+            init_memory_tables(connection)
+
 
 def _save_run(connection: sqlite3.Connection, run: ResearchRun) -> None:
     """只执行写入；连接和事务由调用方管理。"""
@@ -225,6 +251,7 @@ def append_event(run_id: str, event_type: str, payload: dict) -> int:
 
 def save_run_with_event(
     run: ResearchRun, event_type: str, payload: dict, *, start_planning: bool = False,
+    sequential: bool = False,
 ) -> int:
     """任务与事件一起提交；任一步失败，两次写入一起回滚。"""
     with closing(sqlite3.connect(DB_PATH)) as connection:
@@ -237,7 +264,19 @@ def save_run_with_event(
                     "INSERT INTO run_workflow (run_id, phase) VALUES (?, 'planning')",
                     (run.id,),
                 )
+            if sequential:
+                if not start_planning:
+                    raise ValueError("顺序研究必须从规划阶段创建")
+                connection.execute(
+                    "INSERT INTO research_pipeline(run_id, model_name) VALUES (?, ?)",
+                    (run.id, os.getenv("DEEPSEEK_MODEL", "deepseek-flash")),
+                )
             event_id = _append_event(connection, run.id, event_type, payload)
+            if sequential:
+                from memory_context import capture_context
+                capture_context(connection, run)
+                from quality_storage import initialize
+                initialize(connection, run.id)
     return event_id
 
 
@@ -275,6 +314,8 @@ def load_events(run_id: str) -> list[dict]:
 
 def save_checkpoint(checkpoint: AgentCheckpoint) -> None:
     """最新完整状态和 checkpoint_saved 事件在同一事务提交。"""
+    if isinstance(checkpoint, TaskCheckpoint):
+        raise ValueError("子任务检查点必须使用 save_task_checkpoint 保存")
     checkpoint.validate()
     state_json = json.dumps(asdict(checkpoint), ensure_ascii=False, allow_nan=False)
     with closing(sqlite3.connect(DB_PATH)) as connection:
@@ -509,3 +550,235 @@ def load_task_execution(run_id: str, task_id: str) -> TaskExecution:
 
     validate_task_execution(execution)
     return execution
+
+def start_task_execution(run_id: str, task_id: str) -> None:
+    """将待执行或失败的子任务标记为执行中，并记录事件。"""
+    execution = load_task_execution(run_id, task_id)
+
+    if execution.status not in ("pending", "failed"):
+        raise ValueError("只有待执行或失败的子任务才能开始执行")
+
+    with closing(sqlite3.connect(DB_PATH)) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+
+        with connection:
+            cursor = connection.execute(
+                """
+                UPDATE task_executions
+                SET status = 'running',
+                    answer = NULL,
+                    error = NULL
+                WHERE run_id = ?
+                  AND task_id = ?
+                  AND status = ?
+                """,
+                (run_id, task_id, execution.status),
+            )
+
+            if cursor.rowcount != 1:
+                raise ValueError("子任务状态已发生变化，请重新读取")
+
+            _append_event(
+                connection,
+                run_id,
+                "task_started",
+                {
+                    "task_id": task_id,
+                    "previous_status": execution.status,
+                },
+            )
+
+
+def complete_task_execution(
+    run_id: str, task_id: str, answer: str, evidence_ids: list[str],
+) -> None:
+    """保存最终回答与证据编号；只允许 running → completed。"""
+    execution = load_task_execution(run_id, task_id)
+    completed = replace(
+        execution, status="completed", answer=answer,
+        evidence_ids=evidence_ids, error=None,
+    )
+    _finish_task_execution(execution, completed, "task_completed")
+
+
+def fail_task_execution(
+    run_id: str, task_id: str, error: str,
+    evidence_ids: list[str] | None = None,
+) -> None:
+    """保存失败原因；省略证据编号时保留原记录中的编号。"""
+    execution = load_task_execution(run_id, task_id)
+    failed = replace(
+        execution, status="failed", answer=None, error=error,
+        evidence_ids=(execution.evidence_ids if evidence_ids is None else evidence_ids),
+    )
+    _finish_task_execution(execution, failed, "task_failed")
+
+
+def _finish_task_execution(
+    previous: TaskExecution, updated: TaskExecution, event_type: str,
+) -> None:
+    """结果与事件一起提交；证据内容的存在性由后续执行层负责校验。"""
+    if previous.status != "running":
+        raise ValueError("只有执行中的子任务才能保存完成或失败结果")
+    validate_task_execution(updated)
+    evidence_json = json.dumps(updated.evidence_ids, ensure_ascii=False)
+    payload = {"task_id": updated.task_id, "evidence_count": len(updated.evidence_ids)}
+    if updated.status == "completed":
+        payload["answer_chars"] = len(updated.answer)
+    else:
+        payload["error"] = updated.error
+
+    with closing(sqlite3.connect(DB_PATH)) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            checkpoint_row = connection.execute(
+                "SELECT state_json FROM task_checkpoints WHERE run_id = ? AND task_id = ?",
+                (updated.run_id, updated.task_id),
+            ).fetchone()
+            if checkpoint_row is not None:
+                checkpoint = _restore_task_checkpoint(
+                    connection, updated.run_id, updated.task_id, checkpoint_row[0],
+                )
+                known_ids = {item["id"] for item in checkpoint.evidence}
+                if not set(updated.evidence_ids).issubset(known_ids):
+                    raise ValueError("结果引用的证据尚未保存到子任务检查点")
+            cursor = connection.execute(
+                """UPDATE task_executions
+                SET status = ?, answer = ?, evidence_ids_json = ?, error = ?
+                WHERE run_id = ? AND task_id = ? AND status = 'running'""",
+                (updated.status, updated.answer, evidence_json, updated.error,
+                 updated.run_id, updated.task_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("子任务状态已发生变化，请重新读取")
+            _append_event(connection, updated.run_id, event_type, payload)
+
+
+def _task_checkpoint_owner(connection, run_id, task_id):
+    """同一连接内检查计划、父任务和执行记录，避免跨连接读取快照。"""
+    row = connection.execute(
+        """SELECT p.plan_json, r.question, t.status, t.answer, t.evidence_ids_json, t.error
+        FROM research_plans p JOIN runs r ON r.id = p.run_id
+        JOIN task_executions t ON t.run_id = p.run_id
+        WHERE t.run_id = ? AND t.task_id = ?""", (run_id, task_id),
+    ).fetchone()
+    if row is None:
+        raise LookupError("请先保存计划并初始化子任务执行记录")
+    plan = restore_plan(json.loads(row[0]))
+    if plan.question != row[1].strip():
+        raise ValueError("计划与主任务问题不一致")
+    task = next((task for task in plan.tasks if task.id == task_id), None)
+    if task is None:
+        raise ValueError("子任务不属于已保存计划")
+    execution = TaskExecution(run_id, task_id, row[2], row[3], json.loads(row[4]), row[5])
+    validate_task_execution(execution)
+    return task, execution
+
+
+def _read_research_evidence(connection, run_id):
+    row = connection.execute(
+        "SELECT evidence_json FROM research_evidence WHERE run_id = ?", (run_id,),
+    ).fetchone()
+    if row is None:
+        raise LookupError("这次研究尚未保存共享证据快照")
+    return EvidenceStore.from_records(json.loads(row[0])).all()
+
+
+def _restore_task_checkpoint(connection, run_id, task_id, state_json):
+    checkpoint = TaskCheckpoint.from_dict(json.loads(state_json))
+    if (checkpoint.run_id, checkpoint.task_id) != (run_id, task_id):
+        raise ValueError("子任务检查点所属编号不匹配")
+    task, execution = _task_checkpoint_owner(connection, run_id, task_id)
+    if checkpoint.messages[1]["content"] != task.question:
+        raise ValueError("检查点问题与子任务不一致")
+    shared = _read_research_evidence(connection, run_id)
+    if shared[:len(checkpoint.evidence)] != checkpoint.evidence:
+        raise ValueError("子任务检查点与共享证据不一致")
+    if not set(execution.evidence_ids).issubset({e["id"] for e in checkpoint.evidence}):
+        raise ValueError("执行记录包含检查点之外的证据编号")
+    return checkpoint
+
+
+def save_task_checkpoint(checkpoint: TaskCheckpoint) -> None:
+    """原子保存独立对话、共享证据和事件；拒绝旧快照倒退或覆盖证据。"""
+    if not isinstance(checkpoint, TaskCheckpoint):
+        raise ValueError("必须传入 TaskCheckpoint")
+    checkpoint.validate()
+    # 序列化后重建独立快照，后续调用方修改列表不影响本次保存。
+    state_json = json.dumps(asdict(checkpoint), ensure_ascii=False, allow_nan=False)
+    checkpoint = TaskCheckpoint.from_dict(json.loads(state_json))
+    with closing(sqlite3.connect(DB_PATH)) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            task, execution = _task_checkpoint_owner(connection, checkpoint.run_id, checkpoint.task_id)
+            if execution.status != "running":
+                raise ValueError("只有执行中的子任务才能保存检查点")
+            if checkpoint.messages[1]["content"] != task.question:
+                raise ValueError("检查点问题与子任务不一致")
+            shared_row = connection.execute(
+                "SELECT evidence_json FROM research_evidence WHERE run_id = ?", (checkpoint.run_id,),
+            ).fetchone()
+            if shared_row is None:
+                existing = connection.execute(
+                    "SELECT 1 FROM task_checkpoints WHERE run_id = ?", (checkpoint.run_id,),
+                ).fetchone()
+                if existing:
+                    raise ValueError("已有检查点的共享证据丢失，不能重新初始化")
+                shared = []
+            else:
+                shared = EvidenceStore.from_records(json.loads(shared_row[0])).all()
+            if checkpoint.evidence[:len(shared)] != shared:
+                raise ValueError("共享证据只能追加，不能删除、改写或重新编号")
+            if not set(execution.evidence_ids).issubset({e["id"] for e in checkpoint.evidence}):
+                raise ValueError("检查点缺少执行记录中的证据")
+            previous = connection.execute(
+                "SELECT state_json FROM task_checkpoints WHERE run_id = ? AND task_id = ?",
+                (checkpoint.run_id, checkpoint.task_id),
+            ).fetchone()
+            if previous is not None:
+                old = _restore_task_checkpoint(
+                    connection, checkpoint.run_id, checkpoint.task_id, previous[0],
+                )
+                if (checkpoint.next_step < old.next_step or checkpoint.tool_count < old.tool_count
+                        or checkpoint.model_name != old.model_name
+                        or checkpoint.max_tool_calls != old.max_tool_calls
+                        or checkpoint.messages[:len(old.messages)] != old.messages):
+                    raise ValueError("检查点不能倒退、改写已有对话或重置调用预算")
+                if checkpoint == old:
+                    return
+            connection.execute(
+                """INSERT INTO research_evidence (run_id, evidence_json) VALUES (?, ?)
+                ON CONFLICT(run_id) DO UPDATE SET evidence_json = excluded.evidence_json""",
+                (checkpoint.run_id, json.dumps(checkpoint.evidence, ensure_ascii=False)),
+            )
+            connection.execute(
+                """INSERT INTO task_checkpoints (run_id, task_id, state_json) VALUES (?, ?, ?)
+                ON CONFLICT(run_id, task_id) DO UPDATE SET state_json = excluded.state_json""",
+                (checkpoint.run_id, checkpoint.task_id, state_json),
+            )
+            _append_event(connection, checkpoint.run_id, "task_checkpoint_saved", {
+                "task_id": checkpoint.task_id, "next_step": checkpoint.next_step,
+                "tool_count": checkpoint.tool_count, "evidence_count": len(checkpoint.evidence),
+            })
+
+
+def load_task_checkpoint(run_id: str, task_id: str) -> TaskCheckpoint:
+    """读取检查点原始快照；完成任务也能检查快照，是否恢复由调度器决定。"""
+    with closing(sqlite3.connect(DB_PATH)) as connection:
+        with connection:
+            connection.execute("BEGIN")
+            row = connection.execute(
+                "SELECT state_json FROM task_checkpoints WHERE run_id = ? AND task_id = ?",
+                (run_id, task_id),
+            ).fetchone()
+            if row is None:
+                raise LookupError("这个子任务没有检查点")
+            return _restore_task_checkpoint(connection, run_id, task_id, row[0])
+
+
+def load_research_evidence(run_id: str) -> list[dict]:
+    """为下一个子任务提供统一编号的证据快照；不存在与空列表不同。"""
+    with closing(sqlite3.connect(DB_PATH)) as connection:
+        return _read_research_evidence(connection, run_id)

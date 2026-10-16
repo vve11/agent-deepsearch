@@ -116,6 +116,182 @@ class TaskExecutionStorageTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             database.load_task_execution(self.research.id, "T1")
 
+    def test_start_pending_task_and_record_event(self):
+        database.initialize_task_executions(self.research.id)
+
+        database.start_task_execution(self.research.id, "T1")
+
+        loaded = database.load_task_execution(self.research.id, "T1")
+        self.assertEqual(loaded.status, "running")
+        self.assertIsNone(loaded.answer)
+        self.assertIsNone(loaded.error)
+
+        event = database.load_events(self.research.id)[-1]
+        self.assertEqual(event["event_type"], "task_started")
+        self.assertEqual(
+            event["payload"],
+            {"task_id": "T1", "previous_status": "pending"},
+        )
+
+        # 启动 T1 不应改变 T2。
+        other = database.load_task_execution(self.research.id, "T2")
+        self.assertEqual(other.status, "pending")
+
+    def test_running_task_cannot_start_twice(self):
+        database.initialize_task_executions(self.research.id)
+        database.start_task_execution(self.research.id, "T1")
+        events_before = database.load_events(self.research.id)
+
+        with self.assertRaises(ValueError):
+            database.start_task_execution(self.research.id, "T1")
+
+        # 拒绝重复启动，也不能多写一条启动事件。
+        self.assertEqual(
+            database.load_events(self.research.id),
+            events_before,
+        )
+
+    def test_retry_failed_task_clears_error(self):
+        database.initialize_task_executions(self.research.id)
+
+        # 模拟之前执行失败的状态。
+        with closing(sqlite3.connect(database.DB_PATH)) as connection:
+            with connection:
+                connection.execute(
+                    """
+                    UPDATE task_executions
+                    SET status = 'failed', error = ?
+                    WHERE run_id = ? AND task_id = ?
+                    """,
+                    ("搜索超时", self.research.id, "T1"),
+                )
+
+        database.start_task_execution(self.research.id, "T1")
+
+        loaded = database.load_task_execution(self.research.id, "T1")
+        self.assertEqual(loaded.status, "running")
+        self.assertIsNone(loaded.error)
+
+        event = database.load_events(self.research.id)[-1]
+        self.assertEqual(event["payload"]["previous_status"], "failed")
+    def test_complete_round_trip_and_terminal_state_is_protected(self):
+        database.initialize_task_executions(self.research.id)
+        database.start_task_execution(self.research.id, "T1")
+        database.complete_task_execution(
+            self.research.id, "T1", "结果见 [E1]", ["E1"],
+        )
+        expected = TaskExecution(
+            run_id=self.research.id, task_id="T1", status="completed",
+            answer="结果见 [E1]", evidence_ids=["E1"],
+        )
+        self.assertEqual(database.load_task_execution(self.research.id, "T1"), expected)
+        event = database.load_events(self.research.id)[-1]
+        self.assertEqual(event["event_type"], "task_completed")
+        self.assertEqual(event["payload"], {
+            "task_id": "T1", "evidence_count": 1, "answer_chars": len(expected.answer),
+        })
+        events = database.load_events(self.research.id)
+        for action in (
+            lambda: database.start_task_execution(self.research.id, "T1"),
+            lambda: database.complete_task_execution(self.research.id, "T1", "覆盖", []),
+            lambda: database.fail_task_execution(self.research.id, "T1", "覆盖"),
+        ):
+            with self.assertRaises(ValueError):
+                action()
+        database.initialize_task_executions(self.research.id)
+        self.assertEqual(database.load_task_execution(self.research.id, "T1"), expected)
+        self.assertEqual(database.load_events(self.research.id), events)
+
+    def test_fail_retry_preserves_evidence_and_clears_error(self):
+        database.initialize_task_executions(self.research.id)
+        database.start_task_execution(self.research.id, "T1")
+        database.fail_task_execution(self.research.id, "T1", "搜索超时", ["E1"])
+        failed = database.load_task_execution(self.research.id, "T1")
+        self.assertEqual((failed.status, failed.error, failed.answer), ("failed", "搜索超时", None))
+        self.assertEqual(failed.evidence_ids, ["E1"])
+        event = database.load_events(self.research.id)[-1]
+        self.assertEqual(event["event_type"], "task_failed")
+        self.assertEqual(event["payload"]["error"], "搜索超时")
+        database.start_task_execution(self.research.id, "T1")
+        retried = database.load_task_execution(self.research.id, "T1")
+        self.assertEqual(retried.status, "running")
+        self.assertIsNone(retried.error)
+        self.assertEqual(retried.evidence_ids, ["E1"])
+        database.fail_task_execution(self.research.id, "T1", "再次超时")
+        self.assertEqual(database.load_task_execution(self.research.id, "T1").evidence_ids, ["E1"])
+        database.start_task_execution(self.research.id, "T1")
+        database.complete_task_execution(self.research.id, "T1", "研究完成", ["E1"])
+        self.assertEqual(database.load_task_execution(self.research.id, "T1").status, "completed")
+
+    def test_cannot_finish_pending_or_failed_task(self):
+        database.initialize_task_executions(self.research.id)
+        for status in ("pending", "failed"):
+            if status == "failed":
+                database.start_task_execution(self.research.id, "T1")
+                database.fail_task_execution(self.research.id, "T1", "错误")
+            before = database.load_task_execution(self.research.id, "T1")
+            events = database.load_events(self.research.id)
+            with self.subTest(status=status):
+                with self.assertRaises(ValueError):
+                    database.complete_task_execution(self.research.id, "T1", "结果", [])
+                with self.assertRaises(ValueError):
+                    database.fail_task_execution(self.research.id, "T1", "错误")
+                self.assertEqual(database.load_task_execution(self.research.id, "T1"), before)
+                self.assertEqual(database.load_events(self.research.id), events)
+
+    def test_invalid_result_does_not_change_record_or_events(self):
+        database.initialize_task_executions(self.research.id)
+        database.start_task_execution(self.research.id, "T1")
+        before = database.load_task_execution(self.research.id, "T1")
+        events = database.load_events(self.research.id)
+        cases = [
+            lambda: database.complete_task_execution(self.research.id, "T1", " ", []),
+            lambda: database.complete_task_execution(self.research.id, "T1", "结果", ["E1", "E1"]),
+            lambda: database.complete_task_execution(self.research.id, "T1", "结果", "E1"),
+            lambda: database.fail_task_execution(self.research.id, "T1", ""),
+            lambda: database.fail_task_execution(self.research.id, "T1", "错误", ["T1"]),
+        ]
+        for index, action in enumerate(cases):
+            with self.subTest(case=index), self.assertRaises(ValueError):
+                action()
+            self.assertEqual(database.load_task_execution(self.research.id, "T1"), before)
+            self.assertEqual(database.load_events(self.research.id), events)
+
+    def test_event_failure_rolls_back_each_transition(self):
+        database.initialize_task_executions(self.research.id)
+        append_event = database._append_event
+
+        def append_then_fail(*args):
+            append_event(*args)
+            raise sqlite3.OperationalError("模拟事件保存失败")
+
+        actions = [
+            lambda: database.start_task_execution(self.research.id, "T1"),
+            lambda: database.complete_task_execution(self.research.id, "T1", "结果", []),
+            lambda: database.fail_task_execution(self.research.id, "T1", "错误"),
+        ]
+        for index, action in enumerate(actions):
+            if index == 1:
+                database.start_task_execution(self.research.id, "T1")
+            before = database.load_task_execution(self.research.id, "T1")
+            events = database.load_events(self.research.id)
+            with self.subTest(transition=index):
+                with patch.object(database, "_append_event", side_effect=append_then_fail):
+                    with self.assertRaises(sqlite3.OperationalError):
+                        action()
+                self.assertEqual(database.load_task_execution(self.research.id, "T1"), before)
+                self.assertEqual(database.load_events(self.research.id), events)
+
+    def test_same_task_id_in_different_runs_is_isolated(self):
+        other = ResearchRun(question="另一个研究")
+        database.save_run(other)
+        database.save_plan(other.id, parse_plan(other.question, {"tasks": [{"question": "方向"}]}))
+        for run_id in (self.research.id, other.id):
+            database.initialize_task_executions(run_id)
+        database.start_task_execution(self.research.id, "T1")
+        database.complete_task_execution(self.research.id, "T1", "结果", [])
+        self.assertEqual(database.load_task_execution(other.id, "T1").status, "pending")
+
 
 if __name__ == "__main__":
     unittest.main()

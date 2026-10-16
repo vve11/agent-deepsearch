@@ -5,6 +5,7 @@ from collections.abc import Callable
 
 from model_requests import request_model
 from plan import ResearchPlan, parse_plan
+from memory_context import current_memory_context
 
 
 PLANNER_PROMPT = """
@@ -50,7 +51,7 @@ async def create_plan(
             {"phase": "planning"},
             model=os.getenv("DEEPSEEK_MODEL", "deepseek-flash"),
             messages=[
-                {"role": "system", "content": PLANNER_PROMPT},
+                {"role": "system", "content": PLANNER_PROMPT + current_memory_context()},
                 {"role": "user", "content": question},
             ],
             max_tokens=1200,

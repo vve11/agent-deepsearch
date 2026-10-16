@@ -27,6 +27,12 @@ class PlanningRuntimeTests(unittest.IsolatedAsyncioTestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         database.init_db()
+        # 保留历史单 Agent 流程的回归覆盖；新流程见 test_task_runner.py。
+        original_create = runtime.create_research_run
+        legacy = patch.object(runtime, "create_research_run",
+                              side_effect=lambda question: original_create(question, sequential=False))
+        legacy.start()
+        self.addCleanup(legacy.stop)
 
     def sql(self, statement, args=()):
         with closing(sqlite3.connect(database.DB_PATH)) as connection:

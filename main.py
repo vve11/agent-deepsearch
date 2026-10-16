@@ -17,6 +17,8 @@ async def main():
     logging.getLogger("httpx").setLevel(logging.WARNING)
     try:
         init_db()
+        from memory_jobs import process_pending
+        process_pending(recover_interrupted=True)
     except (sqlite3.Error, OSError) as error:
         print(f"数据库初始化失败：{error}")
         return

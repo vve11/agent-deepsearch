@@ -1,5 +1,6 @@
 """第一版检查点：只恢复到消息完整的下一次模型请求。"""
 import json
+import re
 from dataclasses import dataclass, fields
 
 from evidence import EvidenceStore
@@ -90,3 +91,14 @@ class AgentCheckpoint:
             json.dumps(self.messages, allow_nan=False)
         except (TypeError, ValueError) as error:
             raise ValueError("消息历史不能序列化") from error
+
+
+@dataclass
+class TaskCheckpoint(AgentCheckpoint):
+    """子任务的独立对话快照；evidence 是当时整次研究的证据快照。"""
+    task_id: str = ""
+
+    def validate(self) -> None:
+        super().validate()
+        if not isinstance(self.task_id, str) or not re.fullmatch(r"T[1-9][0-9]*", self.task_id):
+            raise ValueError("子任务检查点编号不正确")

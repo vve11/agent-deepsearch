@@ -18,6 +18,9 @@ PLAN = json.dumps({"tasks": [{"question": "调查测试问题"}]})
 
 class WebApiTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        gate = patch.dict(os.environ, {'QUALITY_GATE_ENABLED': 'false'})
+        gate.start()
+        self.addCleanup(gate.stop)
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         patcher = patch.object(database, "DB_PATH", Path(directory.name) / "test.db")
@@ -67,7 +70,7 @@ class WebApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await browser.post(f"/api/runs/{run_id}/resume")).status_code, 409)
 
     async def test_failed_research_resumes_same_id_without_replanning(self):
-        client = client_with(response(PLAN), ValueError("模拟研究失败"), response("恢复成功"))
+        client = client_with(response(PLAN), ValueError("模拟研究失败"), response("子任务恢复成功"), response("恢复成功"))
         app = create_app(client_factory=lambda: client, load_environment=False)
         async with app.router.lifespan_context(app), self.browser(app) as browser:
             run_id = (await browser.post("/api/runs", json={"question": "测试问题"})).json()["run_id"]
@@ -80,7 +83,7 @@ class WebApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(resumed.json()["run_id"], run_id)
             await self.finished(app)
             self.assertEqual(database.load_run(run_id).answer, "恢复成功")
-            self.assertEqual(client.chat.completions.create.await_count, 3)
+            self.assertEqual(client.chat.completions.create.await_count, 4)
 
     async def test_shutdown_cancels_model_and_new_server_can_resume(self):
         started = asyncio.Event()
@@ -94,7 +97,7 @@ class WebApiTests(unittest.IsolatedAsyncioTestCase):
             run_id = (await browser.post("/api/runs", json={"question": "中断测试"})).json()["run_id"]
             await asyncio.wait_for(started.wait(), 2)
         self.assertEqual(database.load_run(run_id).status, "failed")
-        resumed_client = client_with(response(PLAN), response("重启恢复成功"))
+        resumed_client = client_with(response(PLAN), response("子任务恢复成功"), response("重启恢复成功"))
         new_app = create_app(client_factory=lambda: resumed_client, load_environment=False)
         async with new_app.router.lifespan_context(new_app), self.browser(new_app) as browser:
             detail = (await browser.get(f"/api/runs/{run_id}")).json()

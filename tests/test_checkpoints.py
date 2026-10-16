@@ -58,6 +58,12 @@ class CheckpointTests(unittest.IsolatedAsyncioTestCase):
         db_patch.start()
         self.addCleanup(db_patch.stop)
         database.init_db()
+        # 保留历史单 Agent 流程的回归覆盖；新流程见 test_task_runner.py。
+        original_create = runtime.create_research_run
+        legacy = patch.object(runtime, "create_research_run",
+                              side_effect=lambda question: original_create(question, sequential=False))
+        legacy.start()
+        self.addCleanup(legacy.stop)
         # These tests isolate research/recovery; planner has dedicated integration tests.
         async def planned(client, question, record):
             return parse_plan(question, {"tasks": [{"question": question}]})

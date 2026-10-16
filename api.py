@@ -37,6 +37,8 @@ def create_app(*, client_factory=None, load_environment=True):
         if load_environment:
             load_dotenv(ROOT / ".env")
         database.init_db()
+        from memory_jobs import process_pending
+        process_pending(recover_interrupted=True)
         client = None
         if client_factory is not None:
             client = client_factory()

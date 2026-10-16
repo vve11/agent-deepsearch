@@ -14,6 +14,8 @@ from plan import plan_context
 from checkpoint import AgentCheckpoint
 from evidence import EvidenceStore
 from run import ResearchRun
+from pipeline_storage import load_pipeline
+from task_runner import execute_pipeline, recovery_checkpoint
 
 logger = logging.getLogger(__name__)
 # 第一版只支持单进程；阻止本进程同时恢复同一任务。
@@ -37,6 +39,13 @@ def get_resumable_runs() -> list[dict]:
             "evidence_count": len(checkpoint.evidence) if checkpoint else 0,
             "phase": "research" if checkpoint else load_workflow_phase(row["id"]),
         })
+        pipeline = load_pipeline(row['id'])
+        if pipeline is not None:
+            from database import load_research_evidence
+            summaries[-1]['phase'] = pipeline['phase']
+            summaries[-1]['evidence_count'] = (
+                len(load_research_evidence(row['id'])) if pipeline['phase'] != 'planning' else 0
+            )
     return summaries
 
 
@@ -46,12 +55,16 @@ async def execute_research(client: AsyncOpenAI, question: str) -> ResearchRun:
     return await execute_created_research(client, run)
 
 
-def create_research_run(question: str) -> ResearchRun:
+def create_research_run(question: str, *, sequential: bool = True) -> ResearchRun:
     """先持久化任务，API 才能立即返回一个可查询、可恢复的编号。"""
     if not isinstance(question, str) or not question.strip():
         raise ValueError("研究问题必须是非空字符串")
     run = ResearchRun(question=question.strip())
-    save_run_with_event(run, "run_started", {"question": run.question}, start_planning=True)
+    if sequential:
+        from memory_jobs import process_pending
+        process_pending()
+    save_run_with_event(run, "run_started", {"question": run.question}, start_planning=True,
+                        sequential=sequential)
     return run
 
 
@@ -75,6 +88,10 @@ async def resume_research(client: AsyncOpenAI, run_id: str) -> ResearchRun:
 
 def _recovery_checkpoint(run: ResearchRun) -> AgentCheckpoint | None:
     """缺少检查点只在明确的研究前阶段允许；损坏不能当成不存在。"""
+    from memory_context import load_context
+    load_context(run.id)
+    if load_pipeline(run.id) is not None:
+        return recovery_checkpoint(run.id)
     phase = load_workflow_phase(run.id)
     try:
         checkpoint = load_checkpoint(run.id)
@@ -129,7 +146,14 @@ async def _execute_run(
         raise ValueError("任务正在本进程执行，不能同时恢复")
     _active_runs.add(run.id)
     try:
-        return await _drive_run(client, run, checkpoint, resuming=resuming, startup_saved=startup_saved)
+        from memory_context import load_context, use_memory_context
+        from memory_jobs import process_job
+        with use_memory_context(load_context(run.id)):
+            if load_pipeline(run.id) is not None:
+                result = await execute_pipeline(client, run, prepare_plan, resuming=resuming)
+                process_job(run.id)
+                return result
+            return await _drive_run(client, run, checkpoint, resuming=resuming, startup_saved=startup_saved)
     finally:
         _active_runs.remove(run.id)
 

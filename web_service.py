@@ -5,6 +5,8 @@ from dataclasses import asdict
 
 import database
 import runtime
+from pipeline_storage import load_pipeline
+from task_runner import inspect_pipeline
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +79,12 @@ class RunService:
         result["phase"] = database.load_workflow_phase(run_id)
         result["plan"] = None
         result["warning"] = None
+        from memory_jobs import describe_memory
+        try:
+            result['memory'] = describe_memory(run_id)
+        except (ValueError, TypeError, LookupError) as error:
+            result['memory'] = None
+            result['warning'] = str(error)
         try:
             result["plan"] = asdict(database.load_plan(run_id))
         except LookupError:
@@ -94,6 +102,29 @@ class RunService:
         except (ValueError, TypeError):
             result["warning"] = "检查点数据损坏，无法安全恢复"
         result["can_resume"] = False
+        try:
+            pipeline = load_pipeline(run_id)
+            if pipeline is not None:
+                _, tasks, _ = inspect_pipeline(run_id)
+                result['phase'] = pipeline['phase']
+                result['tasks'] = [asdict(task) for task in tasks]
+                result['budget'] = {key: pipeline[key] for key in
+                                    ('model_limit', 'model_used', 'tool_limit', 'tool_used')}
+                if pipeline['phase'] != 'planning':
+                    result['evidence'] = database.load_research_evidence(run_id)
+        except (ValueError, TypeError, LookupError) as error:
+            result['warning'] = str(error)
+        result['quality'] = None
+        try:
+            from quality_storage import load as load_quality
+            quality = load_quality(run_id)
+            if quality:
+                state = quality[1]
+                result['quality'] = {key: state[key] for key in ('phase','used','limit','checks','reason','report')}
+                if state['phase'] not in {'pending','skipped'}:
+                    result['evidence'] = state['evidence']
+        except (ValueError, TypeError, LookupError) as error:
+            result['warning'] = str(error)
         if not result["active"] and run.status != "completed":
             try:
                 runtime._recovery_checkpoint(run)
